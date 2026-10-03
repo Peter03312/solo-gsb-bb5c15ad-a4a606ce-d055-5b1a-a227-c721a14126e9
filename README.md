@@ -3,6 +3,8 @@
 基于 **Python + FastAPI + SQLite** 的课程学期规划服务：依据课程目录（学分、春秋开课学期、
 先修条件、同修课程），为学生生成满足全部约束、**期限内最早完成**的完整排课方案；
 目录支持版本化修订，方案绑定目录版本，可回看、可确认。
+教务员可按培养方案编号登记**要求版本**（绑定目录版本：必修课程 + 按优先级排列的选修组），
+并凭要求版本与已修课程清单生成**可回看的达成审核**。
 
 ## 功能与规则
 
@@ -56,6 +58,17 @@
     （409）；目录在草案生成后修订同样拒绝（过期）；对已生效草案**重复确认幂等**、不重复占位。
   - **互认按实际修读课程占位**：方案结果里上替代课（如 CS402）就只占替代课名额，
     不会计入原课（CS401）的席位。
+- **培养方案要求版本与达成审核**：教务员按培养方案编号登记**要求版本**，绑定一个
+  **已有课程目录版本**，列出必修课程（声明顺序）与**按优先级排列的选修组**（每组候选课程
+  + 最低学分门槛）；同门课可出现在不同要求中（必修与选修候选、不同选修组之间）。
+  以要求版本和已修课程清单生成**可回看的达成审核**：
+  - 互认课程（按绑定目录版本的互认组）可满足对应必修或选修候选；
+    **一门实际已修课只归属一项**，**同一互认组多门已修课在整次审核中至多计入一门**。
+  - 归属取优顺序：**先最大化满足的必修项数**，再**按选修组顺序最大化各组计入学分**
+    （不超过该组门槛），仍相同则**按归属课程代码序列取字典序最小**。
+  - 返回各项归属、未满足的必修项、各组选修学分缺口及总体是否达成；
+    审核结果保存后可回看，**后续目录或要求修订不改变历史审核**。
+  - 未知目录或课程、重复必修项、非正学分门槛均拒绝且**不留记录**。
 
 ## 快速开始
 
@@ -107,6 +120,12 @@ Compose 通过命名卷 `planner-data` 持久化数据。
 | GET | `/plans/{id}` | 回看方案（含绑定的目录版本号） |
 | POST | `/plans/{id}/confirm` | 确认方案/草案：事务内原子复核目录版本与每门课席位并占位；失败 409 回滚不超卖 |
 | POST | `/plans/{id}/replan` | 已确认方案执行中途滚动重排，生成关联草案（201，不占位） |
+| POST | `/requirements` | 登记培养方案要求版本：绑定已有目录版本，必修课程 + 按优先级排列的选修组（201） |
+| GET | `/requirements` | 要求版本列表（可选 `?program_code=` 过滤） |
+| GET | `/requirements/{id}` | 回看要求版本（含绑定目录版本、必修课程与选修组） |
+| POST | `/requirements/{id}/audits` | 以要求版本 + 已修课程清单生成达成审核并保存（201） |
+| GET | `/requirements/{id}/audits` | 该要求版本下的审核列表 |
+| GET | `/audits/{id}` | 回看审核结果（各项归属、未满足必修项、各组学分缺口、是否达成） |
 
 ### 目录课程字段
 
@@ -472,6 +491,72 @@ curl -X POST http://localhost:8000/plans -H 'Content-Type: application/json' -d 
 
 **互认按实际修读课程占位**：择修替代课 CS402 时只占 CS402 的名额，CS401 名额不被占用。
 
+### 培养方案要求版本与达成审核
+
+教务员按培养方案编号登记**要求版本**：绑定一个**已有课程目录版本**，列出必修课程
+（声明顺序）与按优先级排列的选修组（每组候选课程 + 最低学分门槛）；同门课可出现在
+不同要求中（必修与选修候选、不同选修组之间）。未知目录版本（404）、未知课程（422）、
+重复必修项（422）、非正学分门槛（422）均拒绝且**不留记录**。
+
+```bash
+# 登记要求版本（绑定目录版本 3，必修 + 两组按优先级排列的选修组）
+curl -X POST http://localhost:8000/requirements -H 'Content-Type: application/json' -d '{
+  "program_code": "CS-2026",
+  "catalog_version": 3,
+  "required_courses": ["CS101", "CS201", "CS301", "CS401"],
+  "elective_groups": [
+    {"candidates": ["CS202", "CS302", "CS303"], "min_credits": 3},
+    {"candidates": ["CS402", "PHYS201"], "min_credits": 3}
+  ]
+}'
+# -> 201 {"requirement_version_id": 1, "catalog_version": 3, ...}
+
+curl http://localhost:8000/requirements            # 列表（可按 ?program_code= 过滤）
+curl http://localhost:8000/requirements/1          # 回看要求版本
+```
+
+以要求版本和已修课程清单生成**可回看的达成审核**：互认课程（按绑定目录版本的互认组）
+可满足对应必修或选修候选；一门实际已修课只归属一项；同一互认组多门已修课在整次审核中
+至多计入一门。归属取优顺序：**先最大化满足的必修项数**，再**按选修组顺序最大化各组计入
+学分（不超过该组门槛）**，仍相同则**按归属课程代码序列取字典序最小**（必修项按声明顺序、
+各选修组内按代码升序连接比较）。
+
+```bash
+# 生成审核（目录 v3 声明了互认组 CS301/CS302、CS401/CS402）
+curl -X POST http://localhost:8000/requirements/1/audits \
+  -H 'Content-Type: application/json' -d '{
+    "completed_courses": ["CS101", "CS101L", "CS201", "CS302", "CS401", "CS402"]
+  }'
+# -> 201（节选）
+# {
+#   "audit_id": "...", "requirement_version_id": 1, "catalog_version": 3,
+#   "result": {
+#     "attained": false,
+#     "required": [
+#       {"course": "CS101", "satisfied": true,  "assigned_course": "CS101"},
+#       {"course": "CS201", "satisfied": true,  "assigned_course": "CS201"},
+#       {"course": "CS301", "satisfied": true,  "assigned_course": "CS302"},
+#       {"course": "CS401", "satisfied": true,  "assigned_course": "CS401"}
+#     ],
+#     "unsatisfied_required": [],
+#     "elective_groups": [
+#       {"index": 1, "min_credits": 3, "counted_credits": 0, "gap": 3, "assigned_courses": []},
+#       {"index": 2, "min_credits": 3, "counted_credits": 0, "gap": 3, "assigned_courses": []}
+#     ],
+#     "assigned_courses": ["CS101", "CS201", "CS302", "CS401"],
+#     "unassigned_courses": ["CS101L", "CS402"]
+#   }
+# }
+# 说明：CS302 经互认满足必修 CS301、CS401 满足必修 CS401（簇内代码最小者）；
+# 两个互认簇均被必修消耗，CS302/CS402 不再计入选修组 -> 各组缺口 3，总体未达成。
+
+curl http://localhost:8000/audits/<audit_id>          # 回看审核结果
+curl http://localhost:8000/requirements/1/audits      # 该要求版本下的审核列表
+```
+
+审核结果整体固化保存：**后续目录修订或要求修订（登记新版本）都不改变历史审核**；
+回看始终返回生成时的结果与其绑定的目录版本号。
+
 ### 错误响应
 
 失败时返回相应 HTTP 状态码与原因，不返回部分课表：
@@ -482,8 +567,8 @@ curl -X POST http://localhost:8000/plans -H 'Content-Type: application/json' -d 
 
 | code | HTTP | 含义 |
 | --- | --- | --- |
-| `INVALID_INPUT` | 400/422 | 非法输入：空目标、非正学分/上限、学期格式错误、重复锁定、锁定已修课、锁定学期超出规划期限、互认组含不存在课程/重复归组/少于两门等 |
-| `COURSE_MISSING` | 422 | 课程缺失：目标或锁定课程不在当前目录版本中 |
+| `INVALID_INPUT` | 400/422 | 非法输入：空目标、非正学分/上限、学期格式错误、重复锁定、锁定已修课、锁定学期超出规划期限、互认组含不存在课程/重复归组/少于两门、重复必修项、非正学分门槛、空选修候选组等 |
+| `COURSE_MISSING` | 422 | 课程缺失：目标、锁定或要求版本引用的课程不在当前/绑定目录版本中 |
 | `REQUIREMENT_CONFLICT` | 422 | 条件冲突：先修循环、同修课无共同开课学期、同修课不在目录、锁定与开课季节/同修/不可排课约束冲突等 |
 | `NO_SOLUTION` | 422 | 无解：期限内无法排完（锁定安排、不可排课学期、学分上限/开课季节/先修顺序限制，含全部互认替代均不可行；席位余量不足时消息含已满的课程学期与上限/已占用） |
 | `TOO_COMPLEX` | 422 | 组合或搜索超出内置复杂度上限 |
@@ -493,20 +578,21 @@ curl -X POST http://localhost:8000/plans -H 'Content-Type: application/json' -d 
 | `CAP_BELOW_OCCUPIED` | 409 | 席位上限低于该 (课程,学期) 当前已占用席位，拒绝设置，原上限不变 |
 | `SEAT_CONFLICT` | 409 | 确认时原子复核席位发现余量不足，拒绝确认、事务回滚、原方案与原占位保留（不超卖） |
 | `DRAFT_EXPIRED` | 409 | 重排草案过期：来源方案不存在/未确认，或同一来源已有生效重排结果 |
-| `NOT_FOUND` | 404 | 方案或目录版本不存在 |
+| `NOT_FOUND` | 404 | 方案、目录版本、要求版本或审核不存在 |
 
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 路由与错误处理
+  main.py       # FastAPI 路由与错误处理（含要求版本登记与达成审核接口）
   planner.py    # 规划引擎（先修组枚举、互认替代、同修合并、锁定/不可排课/席位余量约束、回溯排课、字典序选优）
   replan.py     # 执行中途滚动重排（学期顺延、剩余学期课程差异、席位余量透传）
-  schemas.py    # 请求模型与校验（含互认组、席位上限校验）
-  db.py         # SQLite 持久化（目录版本、互认组、方案、重排草案、席位上限 seat_caps 与占位 seat_holds）
+  audit.py      # 达成审核引擎（互认簇归并、必修最大化、选修组按优先级分支限界、归属序列字典序选优）
+  schemas.py    # 请求模型与校验（含互认组、席位上限、要求版本与审核校验）
+  db.py         # SQLite 持久化（目录版本、互认组、方案、重排草案、席位上限/占位、要求版本、达成审核）
   seed_data.py  # 种子课程目录（版本 1）
-tests/          # pytest 单元与 API 集成测试（含课程互认组、席位上限/余量/原子确认/重排占位替换测试）
-examples/       # demo.sh 调用示例、catalog_v2.json 目录修订示例、catalog_v3_equiv.json 互认组修订示例
+tests/          # pytest 单元与 API 集成测试（含课程互认组、席位上限/余量/原子确认/重排占位替换、要求版本与达成审核测试）
+examples/       # demo.sh 调用示例、catalog_v2.json 目录修订示例、catalog_v3_equiv.json 互认组修订示例、requirement_cs2026.json 要求版本示例
 Dockerfile / docker-compose.yml
 ```
 

@@ -1,0 +1,10 @@
+{
+  "note": "计算机专业 2026 级培养要求（示例；catalog_version 由 demo.sh 按当前目录版本注入）",
+  "program_code": "CS-2026",
+  "catalog_version": 3,
+  "required_courses": ["CS101", "CS201", "CS301", "CS401"],
+  "elective_groups": [
+    {"candidates": ["CS202", "CS302", "CS303"], "min_credits": 3},
+    {"candidates": ["CS402", "PHYS201"], "min_credits": 3}
+  ]
+}

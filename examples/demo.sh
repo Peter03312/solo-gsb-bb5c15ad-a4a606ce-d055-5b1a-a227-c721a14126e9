@@ -295,4 +295,49 @@ step "41. 上限低于已占用拒绝（409 CAP_BELOW_OCCUPIED，原上限不变
 curl -s -w '\nHTTP %{http_code}\n' -X PUT "$BASE/seat-caps/CS303/2028-SPRING" \
   -H 'Content-Type: application/json' -d '{"cap": 0}'
 echo "上限查询（仍为 1）："; curl -s "$BASE/seat-caps/CS303/2028-SPRING"; echo
+
+step "42. 登记培养方案要求版本：绑定当前目录版本（必修 + 按优先级排列的选修组）"
+CUR_V=$(curl -s "$BASE/catalog/current" | python3 -c "import sys,json;print(json.load(sys.stdin)['version_id'])")
+REQ_BODY=$(python3 -c "import json,sys;d=json.load(open('$HERE/requirement_cs2026.json'));d['catalog_version']=int(sys.argv[1]);print(json.dumps(d,ensure_ascii=False))" "$CUR_V")
+REQ=$(curl -s -X POST "$BASE/requirements" -H 'Content-Type: application/json' -d "$REQ_BODY")
+echo "$REQ"
+REQ_ID=$(echo "$REQ" | python3 -c "import sys,json;print(json.load(sys.stdin)['requirement_version_id'])")
+
+step "43. 达成审核：以要求版本 + 已修课程清单生成（互认按绑定目录判断；一课只归属一项；同互认组至多计入一门）"
+AUDIT=$(curl -s -X POST "$BASE/requirements/$REQ_ID/audits" -H 'Content-Type: application/json' -d '{
+  "completed_courses": ["CS101", "CS101L", "CS201", "CS202", "CS302", "CS401", "CS402"]
+}')
+echo "$AUDIT"
+AUDIT_ID=$(echo "$AUDIT" | python3 -c "import sys,json;print(json.load(sys.stdin)['audit_id'])")
+
+step "44. 回看审核（含各项归属、未满足必修项、各组学分缺口、总体是否达成）"
+curl -s "$BASE/audits/$AUDIT_ID"; echo
+echo "该要求版本下的审核列表："
+curl -s "$BASE/requirements/$REQ_ID/audits"; echo
+
+step "45. 后续目录/要求修订不改变历史审核：修订目录并登记新要求版本后回看，审核结果不变"
+curl -s -X POST "$BASE/catalog/versions" -H 'Content-Type: application/json' \
+  -d @"$HERE/catalog_v2.json" >/dev/null
+curl -s -X POST "$BASE/requirements" -H 'Content-Type: application/json' -d '{
+  "program_code": "CS-2026", "catalog_version": '"$CUR_V"',
+  "required_courses": ["CS101"]
+}' >/dev/null
+curl -s "$BASE/audits/$AUDIT_ID" | python3 -c "import sys,json;d=json.load(sys.stdin);print('catalog_version:',d['catalog_version'],'attained:',d['result']['attained'])"
+
+step "46. 错误示例：未知目录版本（404）/ 未知课程（422）/ 重复必修项（422）/ 非正学分门槛（422），均不留记录"
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirements" -H 'Content-Type: application/json' -d '{
+  "program_code": "X", "catalog_version": 999, "required_courses": ["CS101"]
+}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirements" -H 'Content-Type: application/json' -d '{
+  "program_code": "X", "catalog_version": 1, "required_courses": ["NOPE101"]
+}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirements" -H 'Content-Type: application/json' -d '{
+  "program_code": "X", "catalog_version": 1, "required_courses": ["CS101", "cs101"]
+}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirements" -H 'Content-Type: application/json' -d '{
+  "program_code": "X", "catalog_version": 1,
+  "elective_groups": [{"candidates": ["CS202"], "min_credits": 0}]
+}'
+echo "要求版本列表（应只有前面成功登记的）："
+curl -s "$BASE/requirements"; echo
 echo done

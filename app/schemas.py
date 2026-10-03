@@ -126,6 +126,71 @@ class SeatCapIn(BaseModel):
     cap: int = Field(ge=0, description="非负席位上限；0 表示该学期已不可再占")
 
 
+class ElectiveGroupIn(BaseModel):
+    """选修组：候选课程 + 最低学分门槛（正整数）。"""
+
+    candidates: list[str] = Field(min_length=1, description="候选课程代码列表，非空")
+    min_credits: int = Field(gt=0, description="最低学分门槛，必须为正整数")
+
+    @field_validator("candidates")
+    @classmethod
+    def norm_candidates(cls, v):
+        codes = sorted({_norm_code(x) for x in v if x.strip()})
+        if not codes:
+            raise ValueError("选修组候选课程不能为空")
+        return codes
+
+
+class RequirementIn(BaseModel):
+    """登记培养方案要求版本：绑定一个已有课程目录版本。
+
+    必修课程按声明顺序；选修组按优先级顺序。同门课可出现在不同要求中
+    （必修与选修候选、不同选修组之间），但必修项不得重复。
+    未知目录版本、未知课程、重复必修项、非正学分门槛均拒绝且不留记录。
+    """
+
+    program_code: str = Field(min_length=1, max_length=64, description="培养方案编号")
+    catalog_version: int = Field(ge=1, description="绑定的课程目录版本号")
+    required_courses: list[str] = Field(
+        default_factory=list, description="必修课程（声明顺序，不得重复）")
+    elective_groups: list[ElectiveGroupIn] = Field(
+        default_factory=list, description="选修组（按优先级顺序），每组给出候选课程与最低学分")
+    note: str = ""
+
+    @field_validator("program_code")
+    @classmethod
+    def norm_program(cls, v):
+        return v.strip()
+
+    @field_validator("required_courses")
+    @classmethod
+    def norm_required(cls, v):
+        return [_norm_code(x) for x in v if x.strip()]
+
+    @model_validator(mode="after")
+    def check_unique_required(self):
+        seen, dups = set(), []
+        for c in self.required_courses:
+            if c in seen and c not in dups:
+                dups.append(c)
+            seen.add(c)
+        if dups:
+            raise ValueError("重复必修项：" + "、".join(dups))
+        return self
+
+
+class AuditIn(BaseModel):
+    """达成审核输入：截至审核时点的已修课程清单。"""
+
+    completed_courses: list[str] = Field(
+        default_factory=list, description="已修课程代码列表（目录外课程不参与归属）")
+
+    @field_validator("completed_courses")
+    @classmethod
+    def norm_codes(cls, v):
+        return sorted({_norm_code(x) for x in v if x.strip()})
+
+
 class ReplanIn(BaseModel):
     """方案执行中途的滚动重排输入。
 

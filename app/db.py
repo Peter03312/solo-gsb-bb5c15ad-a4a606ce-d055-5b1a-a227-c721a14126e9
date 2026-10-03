@@ -60,6 +60,27 @@ CREATE TABLE IF NOT EXISTS seat_holds (
     UNIQUE(plan_id, course_code, semester)
 );
 CREATE INDEX IF NOT EXISTS idx_seat_holds_seat ON seat_holds(course_code, semester);
+-- 培养方案要求版本：按培养方案编号登记，绑定一个已有课程目录版本；
+-- 必修课程按声明顺序、选修组按优先级顺序整体存为 JSON；登记后不可变（修订即新版本）。
+CREATE TABLE IF NOT EXISTS requirement_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    program_code TEXT NOT NULL,              -- 培养方案编号
+    catalog_version_id INTEGER NOT NULL REFERENCES catalog_versions(id),
+    required_courses TEXT NOT NULL,          -- JSON: [code, ...]，声明顺序，无重复
+    elective_groups TEXT NOT NULL,           -- JSON: [{"candidates": [...], "min_credits": n}, ...]，优先级顺序
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+-- 达成审核：以要求版本 + 已修课程清单生成，结果整体固化保存，可回看；
+-- 后续目录或要求修订不改变历史审核。
+CREATE TABLE IF NOT EXISTS audits (
+    id TEXT PRIMARY KEY,
+    requirement_version_id INTEGER NOT NULL REFERENCES requirement_versions(id),
+    completed_courses TEXT NOT NULL,         -- JSON: [code, ...]
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audits_requirement ON audits(requirement_version_id);
 """
 
 # 既有数据库增量升级（SQLite 不支持 CREATE TABLE IF NOT EXISTS 加列）
@@ -331,3 +352,61 @@ def count_active_replan(conn, source_plan_id):
     return conn.execute(
         "SELECT COUNT(*) AS n FROM plans WHERE source_plan_id=? AND status='confirmed'",
         (source_plan_id,)).fetchone()["n"]
+
+
+# ---------------------------------------------------------------- 培养方案要求版本与达成审核
+
+def create_requirement_version(conn, program_code, catalog_version_id,
+                               required_courses, elective_groups, note=""):
+    """登记要求版本：绑定已有目录版本，必修项按声明顺序、选修组按优先级顺序保存。"""
+    cur = conn.execute(
+        "INSERT INTO requirement_versions"
+        " (program_code, catalog_version_id, required_courses, elective_groups, note, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (program_code, catalog_version_id,
+         json.dumps(required_courses, ensure_ascii=False),
+         json.dumps(elective_groups, ensure_ascii=False), note, _now()),
+    )
+    return cur.lastrowid
+
+
+def get_requirement_version(conn, requirement_id):
+    return conn.execute(
+        "SELECT * FROM requirement_versions WHERE id=?", (requirement_id,)).fetchone()
+
+
+def list_requirement_versions(conn, program_code=None):
+    """要求版本列表（可按培养方案编号过滤），按登记顺序。"""
+    if program_code:
+        return conn.execute(
+            "SELECT * FROM requirement_versions WHERE program_code=? ORDER BY id",
+            (program_code,)).fetchall()
+    return conn.execute("SELECT * FROM requirement_versions ORDER BY id").fetchall()
+
+
+def insert_audit(conn, audit_id, requirement_version_id, completed_courses, result):
+    """保存达成审核结果（生成后不可变，可回看）。"""
+    conn.execute(
+        "INSERT INTO audits (id, requirement_version_id, completed_courses, result_json, created_at)"
+        " VALUES (?,?,?,?,?)",
+        (audit_id, requirement_version_id,
+         json.dumps(completed_courses, ensure_ascii=False),
+         json.dumps(result, ensure_ascii=False), _now()),
+    )
+
+
+def get_audit(conn, audit_id):
+    """单条审核（联出其要求版本的培养方案编号与绑定目录版本，供回看）。"""
+    return conn.execute(
+        "SELECT a.*, r.program_code, r.catalog_version_id FROM audits a"
+        " JOIN requirement_versions r ON r.id = a.requirement_version_id"
+        " WHERE a.id=?", (audit_id,)).fetchone()
+
+
+def list_audits(conn, requirement_version_id):
+    """某要求版本下的全部审核（新的在前）。"""
+    return conn.execute(
+        "SELECT a.*, r.program_code, r.catalog_version_id FROM audits a"
+        " JOIN requirement_versions r ON r.id = a.requirement_version_id"
+        " WHERE a.requirement_version_id=? ORDER BY a.created_at DESC, a.id DESC",
+        (requirement_version_id,)).fetchall()
