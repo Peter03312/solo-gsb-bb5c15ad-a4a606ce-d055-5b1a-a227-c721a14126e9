@@ -60,6 +60,28 @@ CREATE TABLE IF NOT EXISTS seat_holds (
     UNIQUE(plan_id, course_code, semester)
 );
 CREATE INDEX IF NOT EXISTS idx_seat_holds_seat ON seat_holds(course_code, semester);
+-- 培养方案要求版本：按培养方案编号登记，绑定一个既有课程目录版本；一经登记不可修改。
+-- 后续目录修订不影响本版本——绑定版本号固定，审核始终按该版本的学分与互认组计算。
+CREATE TABLE IF NOT EXISTS requirement_versions (
+    id TEXT PRIMARY KEY,                        -- <program_code>:v<version>
+    program_code TEXT NOT NULL,
+    version INTEGER NOT NULL,                   -- 培养方案编号内从 1 起
+    catalog_version_id INTEGER NOT NULL REFERENCES catalog_versions(id),
+    note TEXT NOT NULL DEFAULT '',
+    content_json TEXT NOT NULL,                 -- 必修课与选修组（顺序即优先级）
+    created_at TEXT NOT NULL,
+    UNIQUE(program_code, version)
+);
+-- 达成审核：以要求版本 + 已修清单生成的可回看快照；不随后续目录/要求修订而改变。
+CREATE TABLE IF NOT EXISTS audits (
+    id TEXT PRIMARY KEY,
+    requirement_version_id TEXT NOT NULL REFERENCES requirement_versions(id),
+    catalog_version_id INTEGER NOT NULL,       -- 冗余快照绑定版本号，回看免联表
+    completed_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audits_requirement ON audits(requirement_version_id);
 """
 
 # 既有数据库增量升级（SQLite 不支持 CREATE TABLE IF NOT EXISTS 加列）
@@ -331,3 +353,90 @@ def count_active_replan(conn, source_plan_id):
     return conn.execute(
         "SELECT COUNT(*) AS n FROM plans WHERE source_plan_id=? AND status='confirmed'",
         (source_plan_id,)).fetchone()["n"]
+
+
+# ---------------------------------------------------------------- 培养方案要求版本
+
+def insert_requirement_version(conn, rv_id, program_code, version, catalog_version_id,
+                               note, content):
+    """登记一个要求版本；同一培养方案编号内版本号冲突时由 UNIQUE 约束拒绝。"""
+    conn.execute(
+        "INSERT INTO requirement_versions (id, program_code, version, catalog_version_id,"
+        " note, content_json, created_at) VALUES (?,?,?,?,?,?,?)",
+        (rv_id, program_code, version, catalog_version_id, note,
+         json.dumps(content, ensure_ascii=False), _now()),
+    )
+
+
+def next_requirement_version(conn, program_code):
+    """该培养方案编号的下一个要求版本号（从 1 起）。"""
+    row = conn.execute(
+        "SELECT MAX(version) AS v FROM requirement_versions WHERE program_code=?",
+        (program_code,)).fetchone()
+    return (row["v"] or 0) + 1
+
+
+def get_requirement_version(conn, rv_id):
+    return conn.execute(
+        "SELECT * FROM requirement_versions WHERE id=?", (rv_id,)).fetchone()
+
+
+def list_requirement_versions(conn, program_code=None):
+    if program_code is None:
+        return conn.execute(
+            "SELECT * FROM requirement_versions ORDER BY program_code, version DESC"
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM requirement_versions WHERE program_code=? ORDER BY version DESC",
+        (program_code,)).fetchall()
+
+
+def requirement_version_out(row):
+    content = json.loads(row["content_json"])
+    return {
+        "requirement_version_id": row["id"],
+        "program_code": row["program_code"],
+        "version": row["version"],
+        "catalog_version_id": row["catalog_version_id"],
+        "note": row["note"],
+        "required_courses": content["required_courses"],
+        "elective_groups": content["elective_groups"],
+        "created_at": row["created_at"],
+    }
+
+
+# ---------------------------------------------------------------- 达成审核
+
+def insert_audit(conn, audit_id, requirement_version_id, catalog_version_id,
+                 completed, result):
+    conn.execute(
+        "INSERT INTO audits (id, requirement_version_id, catalog_version_id,"
+        " completed_json, result_json, created_at) VALUES (?,?,?,?,?,?)",
+        (audit_id, requirement_version_id, catalog_version_id,
+         json.dumps(completed, ensure_ascii=False),
+         json.dumps(result, ensure_ascii=False), _now()),
+    )
+
+
+def get_audit(conn, audit_id):
+    return conn.execute("SELECT * FROM audits WHERE id=?", (audit_id,)).fetchone()
+
+
+def list_audits(conn, requirement_version_id=None):
+    if requirement_version_id is None:
+        return conn.execute(
+            "SELECT * FROM audits ORDER BY created_at DESC, id DESC").fetchall()
+    return conn.execute(
+        "SELECT * FROM audits WHERE requirement_version_id=? ORDER BY created_at DESC, id DESC",
+        (requirement_version_id,)).fetchall()
+
+
+def audit_out(row):
+    return {
+        "audit_id": row["id"],
+        "requirement_version_id": row["requirement_version_id"],
+        "catalog_version_id": row["catalog_version_id"],
+        "completed_courses": json.loads(row["completed_json"]),
+        "result": json.loads(row["result_json"]),
+        "created_at": row["created_at"],
+    }

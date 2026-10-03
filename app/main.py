@@ -10,9 +10,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import db
+from .audit import run_audit
 from .planner import Course, PlanError, build_plan, parse_semester
 from .replan import replan_plan
-from .schemas import CatalogIn, PlanIn, ReplanIn, SeatCapIn
+from .schemas import (AuditIn, CatalogIn, PlanIn, ReplanIn,
+                      RequirementVersionIn, SeatCapIn)
 
 
 @asynccontextmanager
@@ -177,8 +179,144 @@ def catalog_version(version_id: int):
     }
 
 
-# ---------------------------------------------------------------- 席位上限
+# ---------------------------------------------------------------- 培养方案要求版本
 
+@app.post("/programs/{program_code}/requirement-versions", status_code=201)
+def create_requirement_version(program_code: str, payload: RequirementVersionIn):
+    """教务员按培养方案编号登记要求版本，绑定一个既有课程目录版本。
+
+    编号内版本号自 1 递增；必修重复项、非正学分门槛、候选引用绑定版本中不存在的
+    课程均拒绝（422），绑定目录版本不存在返回 404；任何失败都不写入。
+    要求一经登记即不可修改，后续目录修订不影响本版本。
+    """
+    program_code = program_code.strip()
+    with db.session() as conn:
+        version = db.get_version(conn, payload.catalog_version_id)
+        if version is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND",
+                "message": f"课程目录版本 {payload.catalog_version_id} 不存在，无法绑定"})
+        codes = {r["code"] for r in db.load_courses(conn, payload.catalog_version_id)}
+        missing = [c for c in payload.required_courses if c not in codes]
+        for gp in payload.elective_groups:
+            missing += [c for c in gp.candidates if c not in codes]
+        if missing:
+            raise HTTPException(status_code=422, detail={
+                "code": "COURSE_MISSING",
+                "message": "课程缺失（不在绑定的目录版本 "
+                           f"{payload.catalog_version_id} 中）：{'、'.join(sorted(set(missing)))}"})
+        # 以路径中的培养方案编号为准登记
+        version_no = db.next_requirement_version(conn, program_code)
+        rv_id = f"{program_code}:v{version_no}"
+        content = {
+            "required_courses": payload.required_courses,
+            "elective_groups": [
+                {"name": gp.name, "candidates": gp.candidates, "min_credits": gp.min_credits}
+                for gp in payload.elective_groups
+            ],
+        }
+        db.insert_requirement_version(
+            conn, rv_id, program_code, version_no,
+            payload.catalog_version_id, payload.note, content)
+        row = db.get_requirement_version(conn, rv_id)
+    out = db.requirement_version_out(row)
+    return out
+
+
+@app.get("/programs/requirement-versions")
+def list_all_requirement_versions():
+    """列出全部培养方案的要求版本（按培养方案编号、版本倒序）。"""
+    with db.session() as conn:
+        rows = db.list_requirement_versions(conn)
+    return {"requirement_versions": [db.requirement_version_out(r) for r in rows]}
+
+
+@app.get("/programs/{program_code}/requirement-versions")
+def list_requirement_versions(program_code: str):
+    """列出某培养方案编号的全部要求版本（版本倒序）。"""
+    with db.session() as conn:
+        rows = db.list_requirement_versions(conn, program_code.strip())
+    return {"requirement_versions": [db.requirement_version_out(r) for r in rows]}
+
+
+@app.get("/programs/requirement-versions/{rv_id}")
+def get_requirement_version(rv_id: str):
+    """回看单个要求版本（含必修与按优先级排列的选修组）。"""
+    with db.session() as conn:
+        row = db.get_requirement_version(conn, rv_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"要求版本 {rv_id} 不存在"})
+    return db.requirement_version_out(row)
+
+
+# ---------------------------------------------------------------- 达成审核
+
+def _audit_snapshot(conn, row, completed):
+    """按要求版本绑定的目录快照计算审核：学分与互认组均取自绑定版本。"""
+    catalog_rows = db.load_courses(conn, row["catalog_version_id"])
+    credits = {r["code"]: r["credits"] for r in catalog_rows}
+    equiv_groups = db.load_equiv_groups(conn, row["catalog_version_id"])
+    content = json.loads(row["content_json"])
+    return run_audit(
+        credits=credits,
+        equiv_groups=equiv_groups,
+        required=content["required_courses"],
+        elective_groups=content["elective_groups"],
+        completed=completed,
+    )
+
+
+@app.post("/requirement-versions/{rv_id}/audits", status_code=201)
+def create_audit(rv_id: str, payload: AuditIn):
+    """以要求版本和已修课程清单生成可回看的达成审核并落库。
+
+    互认课程可满足对应必修或选修候选，但一门已修课只归属一项、同一互认组至多计入
+    一门；先最大化必修满足数，再按选修组顺序最大化各组计入学分（不超过门槛），
+    仍相同取归属课程代码序列字典序最小。未知课程拒绝（422）且不留记录。
+    审核保存的是快照，后续目录或要求修订不改变历史审核。
+    """
+    with db.session() as conn:
+        row = db.get_requirement_version(conn, rv_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"要求版本 {rv_id} 不存在"})
+        try:
+            result = _audit_snapshot(conn, row, payload.completed_courses)
+        except PlanError as exc:
+            status = 400 if exc.code == "INVALID_INPUT" else 422
+            raise HTTPException(status_code=status,
+                                detail={"code": exc.code, "message": exc.message})
+        audit_id = uuid.uuid4().hex[:12]
+        db.insert_audit(conn, audit_id, rv_id, row["catalog_version_id"],
+                        payload.completed_courses, result)
+        saved = db.get_audit(conn, audit_id)
+    return db.audit_out(saved)
+
+
+@app.get("/audits")
+def list_audits(requirement_version_id: str | None = None):
+    """审核列表；可用 ?requirement_version_id= 过滤某要求版本的全部历史审核。"""
+    with db.session() as conn:
+        if requirement_version_id is not None:
+            rows = db.list_audits(conn, requirement_version_id)
+        else:
+            rows = db.list_audits(conn)
+    return {"audits": [db.audit_out(r) for r in rows]}
+
+
+@app.get("/audits/{audit_id}")
+def get_audit(audit_id: str):
+    """回看历史审核（结果为生成时的快照，不随后续目录/要求修订变化）。"""
+    with db.session() as conn:
+        row = db.get_audit(conn, audit_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail={
+                "code": "NOT_FOUND", "message": f"审核 {audit_id} 不存在"})
+    return db.audit_out(row)
+
+
+# ---------------------------------------------------------------- 席位上限
 @app.put("/seat-caps/{course_code}/{semester}")
 def set_seat_cap(course_code: str, semester: str, payload: SeatCapIn):
     """按课程代码与学期设置非负席位上限（重复设置为覆盖）；未设置表示不限额。

@@ -295,4 +295,61 @@ step "41. 上限低于已占用拒绝（409 CAP_BELOW_OCCUPIED，原上限不变
 curl -s -w '\nHTTP %{http_code}\n' -X PUT "$BASE/seat-caps/CS303/2028-SPRING" \
   -H 'Content-Type: application/json' -d '{"cap": 0}'
 echo "上限查询（仍为 1）："; curl -s "$BASE/seat-caps/CS303/2028-SPRING"; echo
+
+step "42. 培养方案要求：按培养方案编号登记要求版本，绑定当前目录（含互认组）"
+RV_VID=$(curl -s "$BASE/catalog/current" | python3 -c "import sys,json;print(json.load(sys.stdin)['version_id'])")
+RV=$(python3 -c "
+import json,sys
+p=json.load(open('$HERE/requirement_cs_2024.json'))
+p['catalog_version_id']=int(sys.argv[1])
+print(json.dumps(p,ensure_ascii=False))" "$RV_VID")
+RV_RESP=$(curl -s -X POST "$BASE/programs/CS-BACH-2024/requirement-versions" \
+  -H 'Content-Type: application/json' -d "$RV")
+echo "$RV_RESP"
+RV_ID=$(echo "$RV_RESP" | python3 -c "import sys,json;print(json.load(sys.stdin)['requirement_version_id'])")
+echo "回看要求版本："; curl -s "$BASE/programs/requirement-versions/$RV_ID"; echo
+
+step "43. 达成审核（应达成）：CS302/CS402 经互认满足必修 CS301/CS401；CS402 只归属必修，专业选修由 CS303 计入"
+AUDIT_OK=$(curl -s -X POST "$BASE/requirement-versions/$RV_ID/audits" \
+  -H 'Content-Type: application/json' -d '{
+    "completed_courses": ["CS101","CS201","CS302","CS402","CS303","MATH101","MATH103"]
+  }')
+echo "$AUDIT_OK"
+AUDIT_OK_ID=$(echo "$AUDIT_OK" | python3 -c "import sys,json;print(json.load(sys.stdin)['audit_id'])")
+
+step "44. 达成审核（有缺口）：缺 CS301/CS401 必修，专业选修计入 CS303，基础拓展 0 学分"
+curl -s -X POST "$BASE/requirement-versions/$RV_ID/audits" \
+  -H 'Content-Type: application/json' -d '{"completed_courses": ["CS101","CS201","CS303"]}'; echo
+
+step "45. 审核互认去重：CS301 与 CS302 都已修也至多计入一门；CS402 归必修后专业选修无课可计"
+curl -s -X POST "$BASE/requirement-versions/$RV_ID/audits" \
+  -H 'Content-Type: application/json' -d '{
+    "completed_courses": ["CS101","CS201","CS301","CS302","CS402"]
+  }' | python3 -c "
+import sys,json
+r=json.load(sys.stdin)['result']
+print('未满足必修:', r['unsatisfied_required'])
+for g in r['elective_groups']:
+    print('选修组', g['index'], g['name'], '计入学分', g['counted_credits'], '缺口', g['credit_gap'])
+print('未归属课程:', [c['code'] for c in r['unattributed_courses']])
+"
+
+step "46. 历史审核回看（快照，后续目录/要求修订不改变结果）与审核列表过滤"
+curl -s "$BASE/audits/$AUDIT_OK_ID" | python3 -c "import sys,json;d=json.load(sys.stdin);print('achieved:',d['result']['achieved'],'catalog_version_id:',d['catalog_version_id'])"
+curl -s "$BASE/audits?requirement_version_id=$RV_ID" \
+  | python3 -c "import sys,json;print('该要求版本审核数:', len(json.load(sys.stdin)['audits']))"
+
+step "47. 错误示例：未知目录（404）/ 未知课程（422）/ 重复必修（422）/ 非正门槛（422），均不留记录"
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/programs/BAD/requirement-versions" \
+  -H 'Content-Type: application/json' -d '{"program_code":"BAD","catalog_version_id": 999, "required_courses": []}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/programs/BAD/requirement-versions" \
+  -H 'Content-Type: application/json' -d '{"program_code":"BAD","catalog_version_id": 1, "required_courses": ["NOPE101"]}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/programs/BAD/requirement-versions" \
+  -H 'Content-Type: application/json' -d '{"program_code":"BAD","catalog_version_id": 1, "required_courses": ["CS101","CS101"]}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/programs/BAD/requirement-versions" \
+  -H 'Content-Type: application/json' -d '{"program_code":"BAD","catalog_version_id": 1, "elective_groups": [{"candidates": ["CS303"], "min_credits": 0}]}'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/requirement-versions/$RV_ID/audits" \
+  -H 'Content-Type: application/json' -d '{"completed_courses": ["UNKNOWN"]}'
+echo "要求版本列表（BAD 无任何版本）："
+curl -s "$BASE/programs/BAD/requirement-versions"; echo
 echo done

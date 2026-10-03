@@ -149,3 +149,79 @@ class ReplanIn(BaseModel):
     @classmethod
     def norm_codes(cls, v):
         return sorted({_norm_code(x) for x in v if x.strip()})
+
+
+# ---------------------------------------------------------------- 培养方案要求与达成审核
+
+class ElectiveGroupIn(BaseModel):
+    """选修组：候选课程集合 + 最低学分门槛（必须为正整数）。
+
+    组内候选代码自动去重；同一门课允许出现在不同选修组或必修项中。
+    """
+
+    name: str = Field(default="", description="选修组名称，如“专业选修课”")
+    candidates: list[str] = Field(min_length=1, description="候选课程代码（非空，组内去重）")
+    min_credits: int = Field(description="该组最低学分门槛，必须为正整数")
+
+    @field_validator("candidates")
+    @classmethod
+    def norm_candidates(cls, v):
+        codes = sorted({_norm_code(x) for x in v if x.strip()})
+        if not codes:
+            raise ValueError("选修组候选课程不能为空")
+        return codes
+
+    @field_validator("min_credits")
+    @classmethod
+    def positive_threshold(cls, v):
+        if v <= 0:
+            raise ValueError("选修组最低学分门槛必须为正整数")
+        return v
+
+
+class RequirementVersionIn(BaseModel):
+    """教务员按培养方案编号登记的要求版本；必须绑定一个既有课程目录版本。
+
+    - program_code：培养方案编号（编号内版本号从 1 起递增，要求一经登记不可修改）；
+    - catalog_version_id：绑定的既有目录版本（互认关系与学分均取自该版本快照）；
+    - required_courses：必修课程（重复必修项一律拒绝）；
+    - elective_groups：按优先级排列的选修组，每组候选课程 + 正学分门槛。
+    """
+
+    program_code: str = Field(min_length=1, max_length=64, description="培养方案编号")
+    catalog_version_id: int = Field(description="绑定的既有课程目录版本号")
+    note: str = ""
+    required_courses: list[str] = Field(default_factory=list, description="必修课程代码")
+    elective_groups: list[ElectiveGroupIn] = Field(
+        default_factory=list, description="选修组（按优先级排列）")
+
+    @field_validator("program_code")
+    @classmethod
+    def norm_program(cls, v):
+        v = v.strip()
+        if not v:
+            raise ValueError("培养方案编号不能为空")
+        return v
+
+    @field_validator("required_courses")
+    @classmethod
+    def norm_required(cls, v):
+        codes = [_norm_code(x) for x in v if x.strip()]
+        dupes = sorted({c for c in codes if codes.count(c) > 1})
+        if dupes:
+            raise ValueError(f"必修课程重复登记：{'、'.join(dupes)}")
+        return codes
+
+
+class AuditIn(BaseModel):
+    """达成审核请求：指定要求版本 + 实际已修课程清单。
+
+    已修课程均须存在于要求版本绑定的目录版本中；未知课程拒绝且不留记录。
+    """
+
+    completed_courses: list[str] = Field(default_factory=list, description="实际已修课程代码")
+
+    @field_validator("completed_courses")
+    @classmethod
+    def norm_codes(cls, v):
+        return sorted({_norm_code(x) for x in v if x.strip()})

@@ -4,6 +4,10 @@
 先修条件、同修课程），为学生生成满足全部约束、**期限内最早完成**的完整排课方案；
 目录支持版本化修订，方案绑定目录版本，可回看、可确认。
 
+教务员还可按**培养方案编号登记要求版本**（必修课程 + 按优先级排列的选修组，绑定一个既有
+课程目录版本），并以要求版本与学生已修课程清单生成**可回看的达成审核**；审核为快照，
+后续目录或要求修订不改变历史审核结果。
+
 ## 功能与规则
 
 - **课程目录**：每门课记录学分、开课季节（`SPRING`/`FALL`，可两者）、先修条件与同修课程。
@@ -56,6 +60,38 @@
     （409）；目录在草案生成后修订同样拒绝（过期）；对已生效草案**重复确认幂等**、不重复占位。
   - **互认按实际修读课程占位**：方案结果里上替代课（如 CS402）就只占替代课名额，
     不会计入原课（CS401）的席位。
+- **培养方案要求版本（本轮新增）**：教务员按**培养方案编号**登记要求版本，绑定一个
+  **既有课程目录版本**；同一编号内版本号自 1 递增，要求一经登记即不可修改。
+  - 要求内容为**必修课程**列表与按**优先级**（声明顺序）排列的**选修组**，每组给出
+    候选课程与**最低学分门槛**（正整数）；同一门课可以出现在多个必修/选修要求中。
+  - 未知绑定目录（404）、候选课程不在绑定目录、重复必修项、非正学分门槛一律拒绝（422/404）
+    且**不留记录**。
+- **达成审核（本轮新增）**：以要求版本 + 实际已修课程清单生成，审核结果落库、可回看。
+  - 互认课程（取自绑定目录版本声明的互认组）可满足对应的必修项或选修候选；
+    但**一门实际已修课只归属一项**，同一互认组的多门已修课**至多计入一门**
+    （跨必修与所有选修组的全局约束）。
+  - 优化目标依次为：① 最大化满足的**必修项数**；② 按选修组**优先级顺序**最大化各组
+    计入学分（每组计入不超过该组门槛，超出部分不占用，可让给后续选修组）；
+    ③ 仍相同时取**归属课程代码序列**（必修按声明顺序、选修按组顺序，组内代码升序）
+    的字典序最小者。
+  - 返回各项归属（直接计入/互认计入及实际课程学分）、**未满足的必修项**、各组
+    **选修学分缺口**、未归属课程与**总体是否达成**。
+  - 审核只依赖绑定目录版本的学分与互认组，是**快照**：后续目录或要求修订不改变历史审核；
+    未知已修课程拒绝（422）且不留记录。
+  - 现有规划、滚动重排、确认与席位行为保持兼容，不受影响。
+
+## 本轮新增（培养方案要求与达成审核）
+
+- 新增 **要求版本登记**：`POST /programs/{培养方案编号}/requirement-versions`，绑定既有
+  课程目录版本，列必修课与按优先级排列的选修组（候选课程 + 正学分门槛）；同门课可出现在
+  不同要求中。未知目录、未知课程、重复必修项、非正门槛均拒绝且不留记录。
+- 新增 **达成审核**：`POST /requirement-versions/{rv_id}/audits`，按"先最大化必修满足数、
+  再按选修组顺序最大化各组封顶学分、再按归属课程代码序列字典序"给出唯一确定的归属；
+  互认课可替代计入，但一门已修课只归属一项、同一互认组至多计入一门。返回各项归属、
+  未满足必修、各组学分缺口与总体是否达成。
+- 审核为**可回看快照**（`GET /audits`、`GET /audits/{id}`），后续目录或要求修订不改变
+  历史审核；启动方式（Docker Compose / uvicorn、自动建表与种子目录）与既有规划、重排、
+  确认、席位接口和数据结构保持兼容，详见下文「培养方案要求版本与达成审核」。
 
 ## 快速开始
 
@@ -107,6 +143,13 @@ Compose 通过命名卷 `planner-data` 持久化数据。
 | GET | `/plans/{id}` | 回看方案（含绑定的目录版本号） |
 | POST | `/plans/{id}/confirm` | 确认方案/草案：事务内原子复核目录版本与每门课席位并占位；失败 409 回滚不超卖 |
 | POST | `/plans/{id}/replan` | 已确认方案执行中途滚动重排，生成关联草案（201，不占位） |
+| POST | `/programs/{program_code}/requirement-versions` | 登记培养方案要求版本（绑定既有目录版本；编号内版本号自增） |
+| GET | `/programs/requirement-versions` | 列出全部培养方案的要求版本 |
+| GET | `/programs/{program_code}/requirement-versions` | 列出某培养方案编号的全部要求版本 |
+| GET | `/programs/requirement-versions/{rv_id}` | 回看单个要求版本（必修 + 按优先级排列的选修组） |
+| POST | `/requirement-versions/{rv_id}/audits` | 以要求版本与已修清单生成达成审核（快照落库，201） |
+| GET | `/audits` | 审核列表（可按 `?requirement_version_id=` 过滤） |
+| GET | `/audits/{id}` | 回看历史审核（结果不随后续修订变化） |
 
 ### 目录课程字段
 
@@ -194,6 +237,150 @@ curl -X POST http://localhost:8000/plans/<plan_id>/replan \
     "completed_courses": ["CS101", "CS101L", "CS201", "MATH103", "CS302"]
   }'
 ```
+
+### 培养方案要求版本与达成审核
+
+#### 1. 登记要求版本（教务员）
+
+按培养方案编号登记，`catalog_version_id` 必须指向一个**既有**课程目录版本；
+必修课程与选修组中引用的课程都必须存在于该绑定版本中。选修组按数组顺序确定
+**优先级**，每组的最低学分门槛必须为正整数。同一门课允许出现在不同必修项/选修组中；
+同一编号再次登记自动成为 v2、v3……，旧版本保持不变。
+
+```bash
+# catalog_version_id=3 绑定含互认组（CS301/CS302、CS401/CS402）的目录版本
+curl -X POST http://localhost:8000/programs/CS-BACH-2024/requirement-versions \
+  -H 'Content-Type: application/json' -d @examples/requirement_cs_2024.json
+```
+
+请求体（`examples/requirement_cs_2024.json`）：
+
+```json
+{
+  "program_code": "CS-BACH-2024",
+  "catalog_version_id": 3,
+  "note": "计算机科学与技术 2024 级培养方案",
+  "required_courses": ["CS101", "CS201", "CS301", "CS401"],
+  "elective_groups": [
+    {"name": "专业选修", "candidates": ["CS303", "CS402"], "min_credits": 3},
+    {"name": "基础拓展", "candidates": ["MATH101", "MATH102", "MATH103"], "min_credits": 6}
+  ]
+}
+```
+
+响应（201）：
+
+```json
+{
+  "requirement_version_id": "CS-BACH-2024:v1",
+  "program_code": "CS-BACH-2024",
+  "version": 1,
+  "catalog_version_id": 3,
+  "required_courses": ["CS101", "CS201", "CS301", "CS401"],
+  "elective_groups": [ ... ],
+  "created_at": "..."
+}
+```
+
+回看与列表：
+
+```bash
+curl http://localhost:8000/programs/CS-BACH-2024/requirement-versions     # 该编号全部版本
+curl http://localhost:8000/programs/requirement-versions                  # 全部培养方案
+curl http://localhost:8000/programs/requirement-versions/CS-BACH-2024:v1  # 单个要求版本
+```
+
+登记校验（均拒绝且**不留记录**）：
+
+```bash
+# 绑定目录版本不存在 -> 404 NOT_FOUND
+curl -X POST .../programs/X/requirement-versions -d '{"program_code":"X","catalog_version_id":999}'
+# 必修/选修候选引用绑定目录中不存在的课程 -> 422 COURSE_MISSING
+# 重复必修项（含大小写重复）-> 422 INVALID_INPUT
+-d '{"program_code":"X","catalog_version_id":1,"required_courses":["CS101","CS101"]}'
+# 非正学分门槛 / 空候选组 -> 422 INVALID_INPUT
+```
+
+#### 2. 生成达成审核
+
+提交实际已修课程清单（课程须在绑定目录版本中；未知课程 422 且不留记录）：
+
+```bash
+curl -X POST http://localhost:8000/requirement-versions/CS-BACH-2024:v1/audits \
+  -H 'Content-Type: application/json' -d '{
+    "completed_courses": ["CS101","CS201","CS302","CS402","CS303","MATH101","MATH103"]
+  }'
+```
+
+响应（201，节选）——已修 **CS302 经互认满足必修 CS301、CS402 满足 CS401**；
+CS402 已归属必修，专业选修只能由 CS303 计入（一门课只归属一项）；
+基础拓展 MATH101(4)+MATH103(3) 计入 6 学分（封顶到门槛），总体达成：
+
+```json
+{
+  "audit_id": "f62ed6f9fdc5",
+  "requirement_version_id": "CS-BACH-2024:v1",
+  "catalog_version_id": 3,
+  "completed_courses": ["CS101", "CS201", "CS302", "CS303", "CS402", "MATH101", "MATH103"],
+  "result": {
+    "required": [
+      {"code": "CS101", "satisfied": true,
+       "attributed_course": {"code": "CS101", "credits": 3, "via": "direct"}},
+      {"code": "CS301", "satisfied": true,
+       "attributed_course": {"code": "CS302", "credits": 3, "via": "equivalence"}},
+      {"code": "CS401", "satisfied": true,
+       "attributed_course": {"code": "CS402", "credits": 3, "via": "equivalence"}}
+    ],
+    "elective_groups": [
+      {"index": 1, "name": "专业选修", "candidates": ["CS303", "CS402"],
+       "min_credits": 3, "counted_credits": 3, "credit_gap": 0, "satisfied": true,
+       "attributed_courses": [
+         {"code": "CS303", "credits": 3, "satisfies": "CS303", "via": "direct"}]},
+      {"index": 2, "name": "基础拓展", "candidates": ["MATH101", "MATH102", "MATH103"],
+       "min_credits": 6, "counted_credits": 6, "credit_gap": 0, "satisfied": true,
+       "attributed_courses": [
+         {"code": "MATH101", "credits": 4, "satisfies": "MATH101", "via": "direct"},
+         {"code": "MATH103", "credits": 3, "satisfies": "MATH103", "via": "direct"}]}
+    ],
+    "unsatisfied_required": [],
+    "unattributed_courses": [],
+    "achieved": true
+  }
+}
+```
+
+未达成时同样保存审核（用于回看缺口），例如只修了 `["CS101","CS201","CS303"]`：
+
+```json
+{
+  "unsatisfied_required": ["CS301", "CS401"],
+  "elective_groups": [
+    {"name": "专业选修", "counted_credits": 3, "credit_gap": 0, "satisfied": true},
+    {"name": "基础拓展", "counted_credits": 0, "credit_gap": 6, "satisfied": false}
+  ],
+  "achieved": false
+}
+```
+
+**归属优化规则**（决定课程归属的确定性结果）：
+
+1. **先最大化满足的必修项数**——课程同时能满足必修与选修时让给必修；
+2. 再按选修组声明顺序逐组最大化**计入学分**（`min(门槛, 实际学分之和)`）；
+   高优先级组达门槛后不再占用多余课程，课程可让给后续组；
+3. 以上仍相同，按归属课程代码序列字典序取最小（必修按声明顺序，选修按组顺序，
+   组内代码升序；未满足的必修项/未计入课程的空组排在所有已归属课程之后）。
+4. 全局约束：一门已修课只归属一项；同一互认组内多门已修课至多计入一门，
+   即使它们同时出现在必修和多个选修组中。互认计入时学分按**实际已修课程**计算。
+
+回看与过滤：
+
+```bash
+curl http://localhost:8000/audits/f62ed6f9fdc5                       # 历史审核（快照）
+curl 'http://localhost:8000/audits?requirement_version_id=CS-BACH-2024:v1'  # 按要求版本过滤
+```
+
+历史审核保存的是生成时的快照（含 `catalog_version_id`）：之后目录再修订
+（学分、互认组变化）或同编号登记了 v2 要求版本，`GET /audits/{id}` 的结果都保持不变。
 
 ### 调用示例
 
@@ -482,8 +669,8 @@ curl -X POST http://localhost:8000/plans -H 'Content-Type: application/json' -d 
 
 | code | HTTP | 含义 |
 | --- | --- | --- |
-| `INVALID_INPUT` | 400/422 | 非法输入：空目标、非正学分/上限、学期格式错误、重复锁定、锁定已修课、锁定学期超出规划期限、互认组含不存在课程/重复归组/少于两门等 |
-| `COURSE_MISSING` | 422 | 课程缺失：目标或锁定课程不在当前目录版本中 |
+| `INVALID_INPUT` | 400/422 | 非法输入：空目标、非正学分/上限、学期格式错误、重复锁定、锁定已修课、锁定学期超出规划期限、互认组含不存在课程/重复归组/少于两门、重复必修项、选修组门槛非正/候选为空等 |
+| `COURSE_MISSING` | 422 | 课程缺失：目标或锁定课程不在当前目录版本中；要求版本的必修/选修候选不在绑定目录版本中；审核已修课程未知 |
 | `REQUIREMENT_CONFLICT` | 422 | 条件冲突：先修循环、同修课无共同开课学期、同修课不在目录、锁定与开课季节/同修/不可排课约束冲突等 |
 | `NO_SOLUTION` | 422 | 无解：期限内无法排完（锁定安排、不可排课学期、学分上限/开课季节/先修顺序限制，含全部互认替代均不可行；席位余量不足时消息含已满的课程学期与上限/已占用） |
 | `TOO_COMPLEX` | 422 | 组合或搜索超出内置复杂度上限 |
@@ -493,7 +680,8 @@ curl -X POST http://localhost:8000/plans -H 'Content-Type: application/json' -d 
 | `CAP_BELOW_OCCUPIED` | 409 | 席位上限低于该 (课程,学期) 当前已占用席位，拒绝设置，原上限不变 |
 | `SEAT_CONFLICT` | 409 | 确认时原子复核席位发现余量不足，拒绝确认、事务回滚、原方案与原占位保留（不超卖） |
 | `DRAFT_EXPIRED` | 409 | 重排草案过期：来源方案不存在/未确认，或同一来源已有生效重排结果 |
-| `NOT_FOUND` | 404 | 方案或目录版本不存在 |
+| `NOT_FOUND` | 404 | 方案、目录版本、要求版本或审核不存在；要求版本绑定的目录版本不存在 |
+| `TOO_COMPLEX` | 422 | 达成审核的归属组合（或排课搜索）超出内置复杂度上限 |
 
 ## 项目结构
 
@@ -502,11 +690,12 @@ app/
   main.py       # FastAPI 路由与错误处理
   planner.py    # 规划引擎（先修组枚举、互认替代、同修合并、锁定/不可排课/席位余量约束、回溯排课、字典序选优）
   replan.py     # 执行中途滚动重排（学期顺延、剩余学期课程差异、席位余量透传）
-  schemas.py    # 请求模型与校验（含互认组、席位上限校验）
-  db.py         # SQLite 持久化（目录版本、互认组、方案、重排草案、席位上限 seat_caps 与占位 seat_holds）
+  audit.py      # 达成审核引擎（必修优先、互认去重、选修组优先级学分最大化、归属序列字典序决胜）
+  schemas.py    # 请求模型与校验（含互认组、席位上限、培养方案要求版本与审核校验）
+  db.py         # SQLite 持久化（目录版本、互认组、方案、重排草案、席位 seat_caps/seat_holds、要求版本 requirement_versions、审核 audits）
   seed_data.py  # 种子课程目录（版本 1）
-tests/          # pytest 单元与 API 集成测试（含课程互认组、席位上限/余量/原子确认/重排占位替换测试）
-examples/       # demo.sh 调用示例、catalog_v2.json 目录修订示例、catalog_v3_equiv.json 互认组修订示例
+tests/          # pytest 单元与 API 集成测试（含课程互认组、席位上限/余量/原子确认/重排占位替换、达成审核引擎与 API 测试）
+examples/       # demo.sh 调用示例、catalog_v2.json 目录修订示例、catalog_v3_equiv.json 互认组修订示例、requirement_cs_2024.json 要求版本示例
 Dockerfile / docker-compose.yml
 ```
 
